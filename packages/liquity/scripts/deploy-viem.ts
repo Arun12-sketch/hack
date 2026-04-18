@@ -1,0 +1,387 @@
+/**
+ * Viem-based deploy script for Snowball Liquity V2 contracts.
+ * Avoids ethers v6 nonce race conditions on Creditcoin Testnet.
+ *
+ * Usage: npx tsx scripts/deploy-viem.ts
+ */
+import {
+  createPublicClient,
+  createWalletClient,
+  http,
+  parseEther,
+  formatEther,
+  getContractAddress,
+  type Address,
+  type Abi,
+  type Hash,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import * as fs from "fs";
+import * as path from "path";
+import * as dotenv from "dotenv";
+
+dotenv.config({ path: path.join(__dirname, "../../../.env") });
+dotenv.config();
+
+// ─── Chain config ───
+const creditcoinTestnet = {
+  id: 102031,
+  name: "Creditcoin Testnet" as const,
+  nativeCurrency: { name: "CTC", symbol: "tCTC", decimals: 18 },
+  rpcUrls: {
+    default: { http: ["https://rpc.cc3-testnet.creditcoin.network" as const] },
+  },
+  blockExplorers: {
+    default: { name: "Blockscout", url: "https://creditcoin-testnet.blockscout.com" },
+  },
+  testnet: true,
+} as const;
+
+// ─── Helpers ───
+// Foundry artifact format: { abi, bytecode: { object: "0x..." } }
+function loadArtifact(contractName: string): { abi: Abi; bytecode: `0x${string}` } {
+  const p = path.join(
+    __dirname,
+    `../out/${contractName}.sol/${contractName}.json`
+  );
+  if (fs.existsSync(p)) {
+    const artifact = JSON.parse(fs.readFileSync(p, "utf8"));
+    const bytecode = artifact.bytecode?.object ?? artifact.bytecode;
+    return { abi: artifact.abi, bytecode: bytecode as `0x${string}` };
+  }
+  throw new Error(`Foundry artifact not found: ${contractName} (run 'forge build' first)`);
+}
+
+async function deploy(
+  name: string,
+  args: any[] = []
+): Promise<{ address: Address; abi: Abi }> {
+  const { abi, bytecode } = loadArtifact(name);
+  const hash = await walletClient.deployContract({
+    abi,
+    bytecode,
+    args,
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") throw new Error(`Deploy ${name} failed`);
+  const address = receipt.contractAddress!;
+  console.log(`  ${name}: ${address}`);
+  return { address, abi };
+}
+
+async function send(
+  address: Address,
+  abi: Abi,
+  functionName: string,
+  args: any[] = []
+): Promise<Hash> {
+  const hash = await walletClient.writeContract({
+    address,
+    abi,
+    functionName,
+    args,
+    gas: 3_000_000n,
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") {
+    throw new Error(`TX ${functionName} on ${address} reverted (${hash})`);
+  }
+  return hash;
+}
+
+// ─── Setup clients ───
+const PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY || process.env.ADMIN_PRIVATE_KEY;
+if (!PRIVATE_KEY) {
+  console.error("Set DEPLOYER_PRIVATE_KEY in .env");
+  process.exit(1);
+}
+
+const account = privateKeyToAccount(PRIVATE_KEY as `0x${string}`);
+const publicClient = createPublicClient({
+  chain: creditcoinTestnet as any,
+  transport: http(),
+});
+const walletClient = createWalletClient({
+  account,
+  chain: creditcoinTestnet as any,
+  transport: http(),
+});
+
+// ─── Main ───
+function loadDeployment(name: string): Record<string, any> {
+  const p = path.join(__dirname, `../../../deployments/creditcoin-testnet/${name}.json`);
+  if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, "utf8"));
+  return {};
+}
+
+interface BranchAddresses {
+  addressesRegistry: string;
+  borrowerOperations: string;
+  troveManager: string;
+  stabilityPool: string;
+  activePool: string;
+  defaultPool: string;
+  gasPool: string;
+  collSurplusPool: string;
+  sortedTroves: string;
+  troveNFT: string;
+  priceFeed: string;
+  interestRouter: string;
+}
+
+async function deployBranch(
+  collTokenAddr: Address,
+  priceFeedAddr: Address,
+  interestRouterAddr: Address,
+  sbUSDAddr: Address,
+  mcr: bigint,
+  ccr: bigint,
+  label: string
+): Promise<BranchAddresses> {
+  console.log(`\n--- Deploying ${label} branch ---`);
+
+  // 1. Deploy all contracts
+  const ar = await deploy("AddressesRegistry", [mcr, ccr]);
+  const tm = await deploy("TroveManager");
+  const bo = await deploy("BorrowerOperations");
+  const sp = await deploy("StabilityPool");
+  const ap = await deploy("ActivePool");
+  const dp = await deploy("DefaultPool");
+  const gp = await deploy("GasPool");
+  const csp = await deploy("CollSurplusPool");
+  const st = await deploy("SortedTroves");
+  const nft = await deploy("TroveNFT");
+
+  // 2. Wire AddressesRegistry (includes interestRouter)
+  console.log(`  Wiring AddressesRegistry (${label})...`);
+  await send(ar.address, ar.abi, "setAddresses", [
+    bo.address, tm.address, sp.address, ap.address,
+    dp.address, gp.address, csp.address, st.address,
+    nft.address, priceFeedAddr, interestRouterAddr, sbUSDAddr, collTokenAddr,
+  ]);
+  console.log(`  AddressesRegistry wired ✓`);
+
+  // 3. Initialize via addressesRegistry (sequential, each waits for mine)
+  console.log(`  Initializing contracts (${label})...`);
+  await send(tm.address, tm.abi, "setAddressesRegistry", [ar.address]);
+  console.log(`    TroveManager ✓`);
+  await send(bo.address, bo.abi, "setAddressesRegistry", [ar.address]);
+  console.log(`    BorrowerOperations ✓`);
+  await send(sp.address, sp.abi, "setAddressesRegistry", [ar.address]);
+  console.log(`    StabilityPool ✓`);
+  await send(ap.address, ap.abi, "setAddressesRegistry", [ar.address]);
+  console.log(`    ActivePool ✓`);
+  await send(st.address, st.abi, "setAddressesRegistry", [ar.address]);
+  console.log(`    SortedTroves ✓`);
+
+  // 4. Set direct addresses
+  console.log(`  Setting direct addresses (${label})...`);
+  await send(ap.address, ap.abi, "setAddresses", [
+    bo.address, tm.address, sp.address, dp.address, collTokenAddr,
+  ]);
+  await send(dp.address, dp.abi, "setAddresses", [
+    tm.address, ap.address, collTokenAddr,
+  ]);
+  await send(csp.address, csp.abi, "setAddresses", [
+    bo.address, tm.address, collTokenAddr,
+  ]);
+  await send(st.address, st.abi, "setAddresses", [tm.address, bo.address]);
+  await send(nft.address, nft.abi, "setAddresses", [tm.address, bo.address]);
+  await send(sp.address, sp.abi, "setAddresses", [
+    sbUSDAddr, collTokenAddr, tm.address, ap.address, bo.address,
+  ]);
+  console.log(`  All contracts wired ✓ (${label})`);
+
+  // 5. Verify initialization
+  const mcrValue = await publicClient.readContract({
+    address: bo.address,
+    abi: bo.abi,
+    functionName: "MCR",
+  }) as bigint;
+  console.log(`  Verified BorrowerOps MCR: ${formatEther(mcrValue)}`);
+
+  return {
+    addressesRegistry: ar.address,
+    borrowerOperations: bo.address,
+    troveManager: tm.address,
+    stabilityPool: sp.address,
+    activePool: ap.address,
+    defaultPool: dp.address,
+    gasPool: gp.address,
+    collSurplusPool: csp.address,
+    sortedTroves: st.address,
+    troveNFT: nft.address,
+    priceFeed: priceFeedAddr,
+    interestRouter: interestRouterAddr,
+  };
+}
+
+async function main() {
+  const balance = await publicClient.getBalance({ address: account.address });
+  console.log(`Deploying with: ${account.address}`);
+  console.log(`Balance: ${formatEther(balance)} tCTC\n`);
+
+  // Load integration deployment for oracle adapters and interest router
+  const integration = loadDeployment("integration");
+
+  // ==================== Phase 1: Mock Tokens & Oracles ====================
+  console.log("=== Phase 1: Mock Tokens & Price Feeds ===");
+  const wCTC = await deploy("MockWCTC");
+  const lstCTC = await deploy("MockLstCTC");
+
+  // Use integration LiquityPriceFeedAdapters if available, fallback to MockPriceFeed
+  let pfWCTC: { address: Address; abi: Abi };
+  let pfLstCTC: { address: Address; abi: Abi };
+  let interestRouterAddr: Address;
+
+  if (integration.oracle?.liquityAdapters) {
+    pfWCTC = { address: integration.oracle.liquityAdapters.wCTC as Address, abi: [] };
+    pfLstCTC = { address: integration.oracle.liquityAdapters.lstCTC as Address, abi: [] };
+    console.log(`  Using LiquityPriceFeedAdapter (wCTC): ${pfWCTC.address}`);
+    console.log(`  Using LiquityPriceFeedAdapter (lstCTC): ${pfLstCTC.address}`);
+  } else {
+    pfWCTC = await deploy("MockPriceFeed", [parseEther("0.2")]);
+    pfLstCTC = await deploy("MockPriceFeed", [parseEther("0.2")]);
+    console.log("  (fallback: MockPriceFeed — run integration deploy first for real oracles)");
+  }
+
+  if (integration.interestRouter?.address) {
+    interestRouterAddr = integration.interestRouter.address as Address;
+    console.log(`  Using SnowballInterestRouter: ${interestRouterAddr}`);
+  } else {
+    // Deploy a no-op MockInterestRouter as fallback
+    const mockIR = await deploy("MockInterestRouter");
+    interestRouterAddr = mockIR.address;
+    console.log("  (fallback: MockInterestRouter — run integration deploy first)");
+  }
+
+  // ==================== Phase 2: SbUSD Token ====================
+  console.log("\n=== Phase 2: SbUSD Token ===");
+  const sbUSD = await deploy("SbUSDToken");
+
+  // ==================== Phase 3-4: Branches ====================
+  console.log("\n=== Phase 3: Branch 0 (wCTC) — MCR 110%, CCR 150% ===");
+  const branch0 = await deployBranch(
+    wCTC.address, pfWCTC.address, interestRouterAddr, sbUSD.address,
+    parseEther("1.1"), parseEther("1.5"), "wCTC"
+  );
+
+  console.log("\n=== Phase 4: Branch 1 (lstCTC) — MCR 120%, CCR 160% ===");
+  const branch1 = await deployBranch(
+    lstCTC.address, pfLstCTC.address, interestRouterAddr, sbUSD.address,
+    parseEther("1.2"), parseEther("1.6"), "lstCTC"
+  );
+
+  // ==================== Phase 5: Wire sbUSD ====================
+  console.log("\n=== Phase 5: Wire sbUSD ===");
+  await send(sbUSD.address, sbUSD.abi, "setBranchAddresses", [
+    branch0.troveManager as Address,
+    branch0.stabilityPool as Address,
+    branch0.borrowerOperations as Address,
+    branch0.activePool as Address,
+  ]);
+  console.log("  sbUSD wired to Branch 0 ✓");
+
+  await send(sbUSD.address, sbUSD.abi, "setBranchAddresses", [
+    branch1.troveManager as Address,
+    branch1.stabilityPool as Address,
+    branch1.borrowerOperations as Address,
+    branch1.activePool as Address,
+  ]);
+  console.log("  sbUSD wired to Branch 1 ✓");
+
+  // ==================== Phase 6: Collateral Registry ====================
+  console.log("\n=== Phase 6: Collateral Registry ===");
+  const cr = await deploy("CollateralRegistry", [sbUSD.address]);
+  await send(cr.address, cr.abi, "addBranch", [
+    wCTC.address, branch0.troveManager as Address,
+    branch0.borrowerOperations as Address, branch0.stabilityPool as Address,
+    branch0.activePool as Address, pfWCTC.address,
+  ]);
+  console.log("  Branch 0 (wCTC) added ✓");
+
+  await send(cr.address, cr.abi, "addBranch", [
+    lstCTC.address, branch1.troveManager as Address,
+    branch1.borrowerOperations as Address, branch1.stabilityPool as Address,
+    branch1.activePool as Address, pfLstCTC.address,
+  ]);
+  console.log("  Branch 1 (lstCTC) added ✓");
+
+  await send(sbUSD.address, sbUSD.abi, "setCollateralRegistry", [cr.address]);
+  console.log("  sbUSD CollateralRegistry set ✓");
+
+  // ==================== Phase 7: Helpers ====================
+  console.log("\n=== Phase 7: Helpers ===");
+  const hh = await deploy("HintHelpers", [cr.address]);
+  const mtg = await deploy("MultiTroveGetter", [cr.address]);
+
+  // RedemptionHelper: needs collateralRegistry + array of addressesRegistries
+  const redemptionHelper = await deploy("RedemptionHelper", [
+    cr.address,
+    [branch0.addressesRegistry as Address, branch1.addressesRegistry as Address],
+  ]);
+  console.log("  RedemptionHelper ✓");
+
+  // DebtInFrontHelper: needs collateralRegistry + hintHelpers
+  const debtInFrontHelper = await deploy("DebtInFrontHelper", [
+    cr.address,
+    hh.address,
+  ]);
+  console.log("  DebtInFrontHelper ✓");
+
+  // ==================== Phase 7.5: AgentVault ====================
+  console.log("\n=== Phase 7.5: AgentVault ===");
+  const agentVault = await deploy("AgentVault");
+
+  // ==================== Phase 8: Mint initial tokens ====================
+  console.log("\n=== Phase 8: Mint initial tokens ===");
+  await send(wCTC.address, wCTC.abi, "mint", [
+    account.address, parseEther("1000000"),
+  ]);
+  console.log("  Minted 1,000,000 wCTC ✓");
+
+  await send(lstCTC.address, lstCTC.abi, "mint", [
+    account.address, parseEther("1000000"),
+  ]);
+  console.log("  Minted 1,000,000 lstCTC ✓");
+
+  // ==================== Phase 9: Save Addresses ====================
+  const addresses = {
+    network: {
+      name: "Creditcoin Testnet",
+      chainId: 102031,
+      rpc: "https://rpc.cc3-testnet.creditcoin.network",
+      explorer: "https://creditcoin-testnet.blockscout.com",
+    },
+    tokens: {
+      wCTC: wCTC.address,
+      lstCTC: lstCTC.address,
+      sbUSD: sbUSD.address,
+    },
+    branches: { wCTC: branch0, lstCTC: branch1 },
+    shared: {
+      collateralRegistry: cr.address,
+      hintHelpers: hh.address,
+      multiTroveGetter: mtg.address,
+      redemptionHelper: redemptionHelper.address,
+      debtInFrontHelper: debtInFrontHelper.address,
+      agentVault: agentVault.address,
+    },
+  };
+
+  // Save to deployments/creditcoin-testnet/liquity.json
+  const outPath = path.join(__dirname, "../../../deployments/creditcoin-testnet/liquity.json");
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, JSON.stringify(addresses, null, 2));
+
+  console.log("\n✅ Deployment complete!");
+  console.log(`  Saved to: ${outPath}`);
+  console.log(JSON.stringify(addresses, null, 2));
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("\n❌ Deployment failed:", err.message || err);
+    process.exit(1);
+  });

@@ -1,0 +1,43 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+coverage/
+
+# Hardhat
+cache/
+artifacts/
+typechain-types/
+
+# Foundry
+out/
+
+# Deployment
+deployments/localhost/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Next.js
+.next/
+*.tsbuildinfo
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+.codex-discuss-session
+
+simulation-accounts.json
+
+# SQLite data
+data/
+logs/
+

@@ -1,0 +1,29 @@
+{
+  "name": "snowball",
+  "version": "0.21.0",
+  "private": true,
+  "description": "Snowball — Smart Contract Monorepo for Creditcoin Network",
+  "scripts": {
+    "build": "pnpm -r build",
+    "clean": "pnpm -r clean",
+    "test": "pnpm -r test",
+    "deploy:liquity": "pnpm --filter @snowball/liquity deploy",
+    "deploy:erc-8004": "pnpm --filter @snowball/erc-8004 deploy",
+    "deploy:algebra": "pnpm --filter @snowball/algebra deploy",
+    "deploy:morpho": "pnpm --filter @snowball/morpho deploy",
+    "deploy:oracle": "pnpm --filter @snowball/oracle deploy",
+    "deploy:options": "pnpm --filter @snowball/options deploy",
+    "merge-addresses": "npx tsx scripts/merge-addresses.ts"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "@nestjs/core", "@reown/appkit"]
+  },
+  "devDependencies": {
+    "@uniswap/v3-core": "1.0.1",
+    "@uniswap/v3-periphery": "1.4.4",
+    "tsx": "^4.21.0"
+  }
+}

@@ -1,0 +1,12 @@
+packages:
+  - "packages/core"
+  - "packages/liquity"
+  - "packages/algebra"
+  - "packages/morpho"
+  - "packages/erc-8004"
+  - "packages/shared"
+  - "packages/yield"
+  - "packages/oracle"
+  - "packages/options"
+  - "packages/agent-runtime"
+  - "apps/*"

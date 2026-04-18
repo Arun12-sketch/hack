@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+auto_detect_solc = true
+optimizer = true
+optimizer_runs = 50
+via_ir = true
+evm_version = "cancun"
+remappings = [
+  "forge-std/=lib/forge-std/src/",
+  "morpho-blue/=src/morpho-blue/",
+  "metamorpho/=src/metamorpho/",
+  "morpho-blue-irm/=src/morpho-blue-irm/",
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+]
